@@ -1,0 +1,324 @@
+---
+title: "Team 80 - There Goes the Neighborhood: Predicting Gentrification in the United States"
+output: html_document
+---
+
+One of the biggest challenges with gentrification is that people are not aware that it is happening in a community until it is too late to address it and native residents have already been displaced. If local governments are aware that their communities are likely to become gentrified, they can allocate resources, gather community input and enact policies to avoid widespread displacement of native residents. In this project, we develop a model to predict which U.S. counties are at risk of becoming gentrified based on several predictors.
+
+```{r, echo = FALSE}
+library(caTools)
+library(DMwR)
+library(mlbench)
+library(randomForest)
+library(caret)
+library(rpart)
+library(xlsx)
+library(psych)
+library(RColorBrewer)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(neuralnet)
+library(partykit)
+```
+
+Our main dataset is sourced from the "2020 Healthiest Communities rankings". The 2020 Healthiest Communities rankings were created in collaboration with the Aetna Foundation, an independent affiliate of CVS Health. The University of Missouri Extension Crnter for Applied Research and Engagement Systems performed data collection and analysis. This data is publicly available through the following website which has a profile for each U.S. county and shows their respective performance across 84 metrics in 10 categories (Population Health, Equity, Education, Economy, Housing, Food & Nutrition, Environment, Public Safety, Community Vitality, and Infrastructure): https://www.usnews.com/news/healthiest-communities/district-of-columbia/district-of-columbia
+
+First, we load in our data after we have webscarped it and notice that it is tall.
+
+```{r}
+df <- read.csv("https://raw.githubusercontent.com/omarp120/Predicting-Gentrification/main/us_news_factors.csv")
+head(df)
+```
+
+We also drop any columns that we will not use at this time, like the state and peer group comparisons for each county.
+
+```{r}
+df2 <- subset(df, select = c(County_Name, State_Name, Variables, County))
+head(df2)
+```
+
+Here we transform our data from tall to wide so that each column represents a variable. We have a total of 500 counties and 84 different variables that we can use as inputs for our model.
+
+```{r}
+df_wide <- df2 %>% spread(Variables, County)
+head(df_wide)
+```
+
+In this section, we export our file to Excel so that we can convert our variables to the correct numerical formats and ratios (double or integrer), and then we re-import our file into R. This will allow us to properly impute missing values.
+
+```{r}
+#write.csv(df_wide, 'all-us-counties-transformed.csv')
+df_trans <- read.csv("all-us-counties-transformed.csv")
+head(df_trans)
+```
+
+Next, we use KNN imputation to fill in any missing values, using the nearest 2 neighbors to approximate the values to impute with.
+
+```{r}
+df_imputed <- knnImputation(df_trans[,3:86], k=2)
+```
+
+Here we calculate some summary statistics for all of our variables.
+
+```{r}
+summary(df_imputed)
+```
+
+There are too many different correlation pairs to attempt observing as we have 84 different variables, so we instead look at which variables have the strongest relationships in our dataset.
+
+Below are the top 20 strongest correlation pairs in our dataset. It appears that the two variables with the strongest correlation are NeighborhoodDisparityinEducationAttainment and PopulationWithAdvancedDegree.
+
+```{r}
+#devtools::install_github("laresbernardo/lares")
+library(lares)
+
+corr_cross(df_imputed, # name of dataset
+  max_pvalue = 0.05, # display only significant correlations (at 5% level)
+  top = 20
+)
+```
+
+Next, we look at which variables are most highly correlated with our 'AffordableHousingShortfall' variable which is our proxy variable for predicting gentrification. The data source defines this variable as the "Availability of affordable housing relative to a community's low-income population. Negative numbers indicate a shortfall."
+
+It appears that "Households Spending at least 30% of income on Housing" is the strongest predictor of an affordable housing shortfall, or gentrification.
+
+```{r}
+corr_var(df_imputed, # name of dataset
+  AffordableHousingShortfall, # name of variable to focus on
+  top = 15 # display top 5 correlations
+) 
+```
+
+Next, we work on developing 7 different models for predicting gentrification using our proxy AffordableHousingShortfall variable. We will select the "best" model by evaluating them in terms of their RMSE.
+
+We start by splitting our data into a training and test set, using 80% of our data to train our models and holding out 20% to test them.
+
+```{r}
+#data splitting
+set.seed(101) 
+
+sample = sample.split(df_imputed$AffordableHousingShortfall, SplitRatio = .8)
+
+train = subset(df_imputed, sample == TRUE)
+test  = subset(df_imputed, sample == FALSE)
+
+train_X = subset(train, select = -AffordableHousingShortfall)
+train_y = train[,'AffordableHousingShortfall']
+
+test_X = subset(test, select = -AffordableHousingShortfall)
+test_y = test[,'AffordableHousingShortfall']
+```
+
+## Linear Regression Model
+
+Linear regression is an attractive model because representation is simply done. The representation is a linear equation that combines a specific set of input values (x) the solution to which is the predicted output for that set of input values (y). In this instance, we will be predicting AffordableHousingShortfall values through three different linear regression techniques.
+
+### GLM
+
+The generalized linear model (GLM) is a flexible generalization of ordinary linear regression that allows for response variables that have error distribution models other than a normal distribution. The GLM generalizes linear regression by allowing the linear model to be related to the response variable via a link function and by allowing the magnitude of the variance of each measurement to be a function of its predicted value.
+
+```{r}
+control = trainControl(method = 'cv', number = 5, 
+  verboseIter = FALSE, savePredictions = TRUE,allowParallel = T)
+```
+
+```{r}
+set.seed(17)
+GLM_train = train(AffordableHousingShortfall ~ ., data = train, metric = 'RMSE', method = 'glm',preProcess = c('center', 'scale'), trControl = control)
+GLM_reg_pred <- predict(GLM_train, test_X)
+
+GLM_train
+```
+
+Using RMSE as a benchmark for linear regression modelling, we determined our GLM model performed quite well at 19.2. We will attempt two other iterations with different linear techniques to determine if our baseline can be improved.
+
+### glmnet
+
+glmnet is an extremely efficient procedure for fitting the entire lasso or elastic-net regularization path for linear regression, logistic and multinomial regression models, Poisson regression and the Cox model. Two recent additions are the multiple-response Gaussian, and the grouped multinomial regression. The algorithm uses cyclical coordinate descent in a path-wise fashion to determine the best linear fit.
+
+```{r}
+set.seed(17)
+glmnet_train = train(AffordableHousingShortfall ~ ., data = train , metric = 'RMSE', method = 'glmnet',preProcess = c('center', 'scale'), trControl = control)
+glmnet_reg_pred <- predict(glmnet_train, test_X)
+
+glmnet_train
+```
+
+The final values used for the GLM Net model were alpha = 0.55 and lambda = 2.85, which produced an RMSE of 17.6. This is a slight improvement over the GLM model. The close results can be explained by low lambda value, where a zero lambda is in effect a standard glm model.
+
+### Partial Least Squares
+
+Partial least squares (PLS) is a method for constructing predictive models when the factors are many and highly collinear. Partial least squares is a popular method for soft modelling in industrial applications. We believed that it would be an effective model to demonstrate.
+
+```{r}
+set.seed(17)
+pls_train = train(AffordableHousingShortfall ~ ., data = train , metric = 'RMSE', method = 'pls',preProcess = c('center', 'scale'), trControl = control)
+pls_reg_pred <- predict(pls_train, test_X)
+
+pls_train
+```
+
+The final value used for the model was ncomp = 2, and it produced an RMSE of 18.11. The GLM Net model outperformed this with a RMSE of 17.6.
+
+## Non-linear Regression Models
+
+In this section, we are going to fit a simple neural network using the neuralnet package.
+
+Here we confirm that there are no more empty data:
+
+```{r}
+#describe(bev)
+apply(df_imputed,2,function(x) sum(is.na(x)))
+```
+
+### Preparing to fit the neural network
+
+Before fitting a neural network, some preparation needs to be done.
+
+As a first step, we are going to address data preprocessing. We will be normalizing the data before training a neural network. We chose to use the min-max method and scale the data in the interval [0,1]. Usually scaling in the intervals [0,1] or [-1,1] tends to give better results.
+
+We therefore scale and split the data before moving on:
+
+```{r }
+maxs <- apply(df_imputed, 2, max) 
+mins <- apply(df_imputed, 2, min)
+```
+
+Scaled returns a matrix that needs to be coerced into a data.frame.
+
+```{r }
+scaled <- as.data.frame(scale(df_imputed, center = mins, scale = maxs - mins))
+#scaled
+index <- sample(1:nrow(df_imputed),round(0.75*nrow(df_imputed)))
+train_ <- scaled[index,]
+test_ <- scaled[-index,]
+```
+
+### Parameters
+
+
+In this dataset, we are going to use 2 hidden layers with this configuration: 83:5:3:1. The input layer has 83 inputs, the two hidden layers have 5 and 3 neurons and the output layer has, of course, a single output since we are doing regression.
+
+Let’s fit the net: Setting the linear.output = True does regression instead of classification.
+
+```{r }
+n <- names(train_)
+f <- as.formula(paste("AffordableHousingShortfall ~", paste(n[!n %in% "AffordableHousingShortfall"], collapse = " + ")))
+nn <- neuralnet(f,data=train_,hidden=c(5,3),linear.output=T)
+```
+
+### Plot the Neural Network
+
+```{r   }
+plot(nn)
+```
+
+The black lines show the connections between each layer and the weights on each connection while the blue lines show the bias term added in each step. The bias can be thought as the intercept of a linear model. The net is essentially a black box so we cannot say that much about the fitting, the weights and the model. Suffice to say that the training algorithm has converged and therefore the model is ready to be used.
+
+### Predicting AffordableHousingShortfall using the neural network
+
+Now we can try to predict the values for the test set and calculate the RMSE. The net will output a normalized prediction, so we need to scale it back in order to make a meaningful comparison (or just a simple prediction).
+
+```{r   }
+pr.nn <- compute(nn,test_[,1:84])
+pr.nn_ <- pr.nn$net.result*(max(df_imputed$AffordableHousingShortfall)-min(df_imputed$AffordableHousingShortfall))+min(df_imputed$AffordableHousingShortfall)
+test.r <- (test_$AffordableHousingShortfall)*(max(df_imputed$AffordableHousingShortfall)-min(df_imputed$AffordableHousingShortfall))+min(df_imputed$AffordableHousingShortfall)
+MSE.nn <- sum((test.r - pr.nn_)^2)/nrow(test_)
+```
+
+The RMSE for our Neural Network is 31.55 which does not perform as well as our GLM net model.
+
+```{r}
+nn.rmse <- sqrt(MSE.nn)
+print(nn.rmse)
+```
+
+## Tree Models
+
+In this next section, we consider various tree models to predict the AffordableHousingShortfall, or gentrification, of a U.S. county given the 83 other indicators.
+
+### Basic Regression Tree
+
+Classification and regression trees can be generated througn rpart to create simple tree models. Tree-based models consist of one or more nested if-then statements for the predictors that partition the data. A model is used to predict the outcome within these partitions. 
+
+```{r}
+treeb <- train(x = train_X, y = train_y, method = "rpart", preProcess = c('center', 'scale'))
+treeb
+```
+
+```{r}
+treebPred <- predict(treeb, newdata = test_X)
+treeb.results <- postResample(pred = treebPred, obs = test_y)
+treeb.results
+```
+
+The RMSE for this basic regression tree model is 24.05 with an RM^2 of 0.17.
+
+We also plot this specific tree below:
+
+```{r}
+plot(as.party(treeb$finalModel))
+```
+
+Next, we will try out a Random Forest model to see if we can improve upon this model.
+
+### Random Forest
+
+Random Forest is an ensemble model where each tree splits out a class prediction and the class with the most contributions becomes the model's prediction value. Random Forest creates as many trees on the subset of the data and combines the output of all the trees. This thus reduces problems in overfitting and reduces the variance.
+
+```{r}
+rf <- train(x = train_X, y = train_y, method = "rf", preProcess = c('center', 'scale'))
+rf
+```
+
+```{r}
+rfPred <- predict(rf, newdata = test_X)
+rf.results <- postResample(pred = rfPred, obs = test_y)
+rf.results
+```
+
+The RMSE for this model is 18.82 with a RM^2 of 0.416. This Random Forest model performes better than our Basic Regression Tree model. We will also consider an XGBoost model to see if we can find any improvements.
+
+### XGBoost
+
+XGBoost is another ensemble model, this time using the gradient boosting framework which is a special case of boosting where errors are minimized by gradient descent algorithm. XGBoost only manages numeric vectors, and luckily all of our variables are numeric.
+
+```{r}
+xgb <- train(x = train_X, y = train_y, method = "xgbTree")
+xgb
+```
+
+```{r}
+xgbPred <- predict(xgb, newdata = test_X)
+xgb.results <- postResample(pred = xgbPred, obs = test_y)
+xgb.results
+```
+
+The RMSE for this model is 20.01 with a RM^2 of 0.357.
+
+We considered Basic Regression, Random Forest and XGBoost tree models, and Random Forest performed the best out of the three in predicting AffordableHousingShortfall as it had the smallest RMSE value at 18.82 with a RM^2 of 0.416.
+
+## Conclusion
+
+Finally, we will choose our best model for predicting AffordableHousingShortfall among the chosen Linear (GLM Net), Non-Linear (Neural Network) and Tree Models (Random Forest) that we have gone over in this analysis. Their RMSE metrics are summarized here:
+
+```{r}
+lin_model_perf <- getTrainPerf(glmnet_train)
+print(lin_model_perf)
+print(nn.rmse)
+rf_perf <- as.data.frame(as.list(rf.results))
+print(rf_perf)
+```
+
+The RMSE for the chosen Linear Model (GLM Net) was 17.604. The RMSE for the chosen Non-Linear Model (Neural Net) was 31.54. And lastly, the RMSE for the chosen Tree model (Random Forest) was 18.82. So, we chose the GLM Net Model as our final model to predict the AffordableHousingShortfall of our counties given the predictors on hand.
+
+In this final chosen GLM Net model, the top 5 predictors that we found to influence AffordableHousingShortfall, or gentrification, for counties are HouseholdsSpendingatLeast30.ofIncomeonHousing, SegregationIndexScore, JobDiversityIndexScore, PopulationWithAdvancedDegree, and UnemploymentRate. 
+
+```{r}
+varImp(glmnet_train)
+```
+
+We should pay close attention to these predictors when trying to learn more about and control for the gentrification of counties in the U.S.
